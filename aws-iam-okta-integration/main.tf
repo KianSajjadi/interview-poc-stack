@@ -18,10 +18,10 @@ provider "aws" {
 
 provider "okta" {
   org_name = "kiansajjadiorg"
-  base_url = "kiansajjadiorg.oktapreview.com"
+  base_url = "okta.com"
   http_proxy = "custom url endpoint for unit testing or local caching proxies"
   api_token = "my api token"
-  scopes = "[COMMA,SEPARATED,SCOPE,VALUES]"
+  #scopes = "[COMMA,SEPARATED,SCOPE,VALUES]"
 }
 
 # Okta saml app for aws preconfigured application
@@ -52,7 +52,7 @@ resource "okta_app_saml" "okta" {
   subject_name_id_template = "${user.email}"
   # is the following meant to be 1.1 or 2.0? ,
   subject_name_id_format = "urn:oasis:names:tc:SAML:1.1?:nameid-format:emailAddress"
-  # can these two following be ed25519?
+  # can these two following be ed25519? - it cannot because SAML/XML with AWS expects RSA_SHA256
   signature_algorithm = "RSA_SHA256"
   digest_algorithm = "SHA256"
   authn_context_class_ref = "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport"
@@ -62,12 +62,12 @@ resource "okta_app_saml" "okta" {
 }
 
 # Define an okta group to the SAML app and assign it to the okta app
-resource "okta_app_group" "aws_readonly" {
+resource "okta_group" "aws_readonly" {
   name = "aws_readonly"
   description = "read-only access to aws"
 }
 
-resource "okta_app_group_assigment" "aws_readonly" {
+resource "okta_group_assignment" "aws_readonly" {
   app_id = okta_app_saml.okta
   group_id = okta_group.readonly.id
 }
