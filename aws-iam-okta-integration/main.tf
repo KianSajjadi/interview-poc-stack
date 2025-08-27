@@ -62,12 +62,12 @@ resource "okta_app_saml" "okta" {
 }
 
 # Define an okta group to the SAML app and assign it to the okta app
-resource "okta_group" "aws_readonly" {
-  name = "aws_readonly"
-  description = "read-only access to aws"
+resource "okta_group" "read_all_buckets_group" {
+  name = "read_all_buckets_group"
+  description = "read-only access to all aws buckets"
 }
 
-resource "okta_group_assignment" "aws_readonly" {
+resource "okta_group_assignment" "aws_reread_all_buckets_groupadonly" {
   app_id = okta_app_saml.okta
   group_id = okta_group.readonly.id
 }
@@ -91,8 +91,8 @@ resource "okta_user" "user_2" {
   #ignoring optionals for timebeing e.g. display name, employee number, etc.
 }
 
-resource "okta_group_memberships" "readonly_group" {
-  group_id = okta_app_group.aws_readonly
+resource "okta_group_memberships" "read_all_buckets_group" {
+  group_id = okta_app_group.read_all_buckets_group
   users = [
     okta_user.user_1.id,
     okta_user.user_2.id
@@ -110,9 +110,38 @@ data "aws_identitystore_group" "devs" {
   }
 }
 
-resource "aws_ssoadmin_account_assignment" "devs_sandbox" {
-  instance_arn       = "sso instnace arn"
-  permission_set_arn = aws_ssoadmin_permission_set.poweruser.arn
+data "aws_iam_policy_document" "read_all_buckets" {
+  statement {
+    sid = "1"
+
+    actions = [
+      "s3:ListAllMyBuckets",
+      "s3:GetBucketLocation",
+    ]
+
+    resources = [
+      "arn:aws:s3:::*",
+    ]
+  }
+}
+
+
+resource "aws_ssoadmin_permission_set" "read_all_buckets" {
+  name = "readonly"
+  description = "readonly_permissionset"
+  instance_arn = tolist(data.aws_ssoadmin_instances.aws_sso)[0]
+  relay_state = ""
+}
+
+resource "aws_ssoadmin_permission_set_inline_policy" "read_all_buckets" {
+  inline_policy = data.aws_iam_policy_document.read_all_buckets.json
+  instance_arn = tolist(data.aws_ssoadmin_instances.aws_sso)[0]
+  permission_set_arn = aws_ssoadmin_permission_set.read_all_buckets.arn
+}
+
+resource "aws_ssoadmin_account_assignment" "read_all_buckets" {
+  instance_arn       = tolist(data.aws_ssoadmin_instances.aws_sso)[0]
+  permission_set_arn = aws_ssoadmin_permission_set.readonly.arn
   principal_type     = "GROUP"
   principal_id       = data.aws_identitystore_group.devs.id
   target_type        = "AWS_ACCOUNT"
