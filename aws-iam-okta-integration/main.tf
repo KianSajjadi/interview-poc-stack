@@ -98,3 +98,23 @@ resource "okta_group_memberships" "readonly_group" {
     okta_user.user_2.id
   ]
 }
+
+# #################################### AWS ################################### #
+data "aws_ssoadmin_instances" "aws_sso" {}
+
+data "aws_identitystore_group" "devs" {
+  identity_store_id = "identity store id"
+  filter {
+    attribute_path  = "DisplayName"
+    attribute_value = "Developers"
+  }
+}
+
+resource "aws_ssoadmin_account_assignment" "devs_sandbox" {
+  instance_arn       = "sso instnace arn"
+  permission_set_arn = aws_ssoadmin_permission_set.poweruser.arn
+  principal_type     = "GROUP"
+  principal_id       = data.aws_identitystore_group.devs.id
+  target_type        = "AWS_ACCOUNT"
+  target_id          = "111122223333"
+}
