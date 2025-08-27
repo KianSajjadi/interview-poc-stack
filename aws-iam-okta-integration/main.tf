@@ -25,8 +25,7 @@ provider "okta" {
 }
 
 # Okta saml app for aws preconfigured application
-resource "okta_app_saml" "example_okta_app" {
-  provider = okta
+resource "okta_app_saml" "okta" {
   # Application's name
   label = "AWS Iam Identity Center"
   # Disable self service
@@ -41,16 +40,61 @@ resource "okta_app_saml" "example_okta_app" {
   default_relay_state = "https://ap-southeast-2.console.aws.amazon.com/"
   hide_ios = false
   hide_web = false
+  # According to the okta provider if a preconfigured_app is used the following block of attributes are optional
+  preconfigured_app = "amazon_aws"
+
+  # I believe these are not required if using the amazon_aws preconfigured application but I may be wrong - it is stated these are required if preconfigured_app is not defined however that doesn't mean
+  # theyre _not_ required if the preconfigured_app is set
   sso_url = "AWS ACS URL"
   recipient = "AWS ACS URL"
   destination = "AWS ACS URL"
   audience = "AWS ENTITY ID FROM AWS METADATA"
-  preconfigured_app = "amazon_aws"
-
-  #I believe these are not required if using the amazon_aws preconfigured application but I may be wrong
   subject_name_id_template = "${user.email}"
-  subject_name_id_format = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
+  # is the following meant to be 1.1 or 2.0? ,
+  subject_name_id_format = "urn:oasis:names:tc:SAML:1.1?:nameid-format:emailAddress"
+  # can these two following be ed25519?
+  signature_algorithm = "RSA_SHA256"
+  digest_algorithm = "SHA256"
+  authn_context_class_ref = "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport"
+
+  # SAML auth response is digitally signed
   response_signed = true
 }
 
-resource ""
+# Define an okta group to the SAML app and assign it to the okta app
+resource "okta_app_group" "aws_readonly" {
+  name = "aws_readonly"
+  description = "read-only access to aws"
+}
+
+resource "okta_app_group_assigment" "aws_readonly" {
+  app_id = okta_app_saml.okta
+  group_id = okta_group.readonly.id
+}
+
+# Mock users for the above group - depending on how users are managed, if via terraform I would have these as an encrypted list and use terraform's loops to simplify it
+resource "okta_user" "user_1" {
+  first_name = "kian"
+  last_name = "sajjadi"
+  login = "kian.s.sajjadi@gmail.com"
+  email = "kian.s.sajjadi@gmail.com"
+
+  #ignoring optionals for timebeing e.g. display name, employee number, etc.
+}
+
+resource "okta_user" "user_2" {
+  first_name = "not_kian"
+  last_name = "not_sajjadi"
+  login = "not.kian.s.sajjadi@gmail.com"
+  email = "not.kian.s.sajjadi@gmail.com"
+
+  #ignoring optionals for timebeing e.g. display name, employee number, etc.
+}
+
+resource "okta_group_memberships" "readonly_group" {
+  group_id = okta_app_group.aws_readonly
+  users = [
+    okta_user.user_1.id,
+    okta_user.user_2.id
+  ]
+}
