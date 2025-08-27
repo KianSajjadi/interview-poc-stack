@@ -1,0 +1,65 @@
+# This is a mock workflow for doing stanard testing/building/upload/deploy for a rnadom app image. It includes hashicorp vault for secrets managment
+name: ci-cd-test
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # this is so that the runner can use jwt auth with vault
+  id-token: write 
+
+env:
+  AWS_REGION: ap-southeast-2
+  ECR_REPOSITORY: some-ecr-repo
+  IMAGE_NAME: ${{ env.ECR_REPOSITORY }}
+  K8S_NAMESPACE: my-go-app
+  DEPLOYMENT_NAME: my-go-app-deployment
+  CONTAINER_NAME: my-go-app
+
+jobs:
+  test:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+      - name: Unit tests
+        run:  go test ./... # assuming it's a simple go app or something
+  build_and_push:
+    needs: test
+    runs-on: [self-hosted, linux, x64]
+    env:
+      COMMIT_SHA: ${{ github.sha }}
+      TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('sha-{0}', github.sha) }}
+      steps:
+        - name: Checkout
+          uses: actions/checkout@v4
+        - name: Configure AWS credentials
+          uses: aws-actions/configure-aws-credentials@v4
+          with:
+            role-to-assume: arn:aws:iam:<SOME_ACCOUNT_ID>:role/cicd-runner-role-for-this-repo
+            aws-region: ${{ env.AWS_REGION }}
+        - name: Login to ECR
+          id: ecr
+          uses: aws-actions/amazon-ecr-login@v2
+        - name: Build, tag, and push image
+          id: build
+          run: |
+            REGISTRY="${{ steps.ecr.outputs.registry }}"
+            IMAGE="$REGISTRY/${{ env.ECR_REPOSITORY }}"
+            echo "BUILDING IMAGE $IMAGE:$TAG..."
+
+            docker build \
+              --push \
+              -t "$IMAGE:${TAG}" \
+              -t "$IMAGE:latest" \
+              .
+            
+            echo "DONE"
+            echo "image_uri=$IMAGE:${TAG}" >> "$GITHUB_OUTPUT"
+
+# assume i've done the rest of the workflow to deploy the application to EKS, this exercise is more for managing hashicorp vault in kubernetes
+          

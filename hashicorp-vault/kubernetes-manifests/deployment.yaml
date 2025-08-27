@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-go-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: my-go-app
+  template:
+    metadata:
+      labels:
+        app: my-go-app
+    annotations:
+      vault.hashicrop.com/agent-inject: "true"
+      vault.hashicorp.com/role: "my-go-app-vault-role"
+      vault.hashicorp.com/agent-inject-secret-db.env: "database/creds/my-go-app-vault-role"
+      vault.hashicorp.com/agent-inject-template-db.env: |
+        {{- with secret "database/creds/my-go-app-vault-role" -}}
+        DATABASE_URL=postgres://{{ .Data.username }}:{{ .Data.password }}@postgres.my-go-app.svc.cluster.local:5432/my-go-app?sslmode=disable
+        {{- end }}
+      vault.hashicorp.com/agent-pre-populate: "true"
+    spec:
+      serviceAccountName: my-go-app-serviceaccount
+      containers:
+      - name: my-go-app
+        image: <SOME_AWS_ACCOUNT_ID>.dkr.ecr.ap-southeast-2.amazonaws.com/my-go-app:latest
+        resources:
+          limits:
+            memory: "128Mi"
+            cpu: "500m"
+        ports:
+        - containerPort: 3000
