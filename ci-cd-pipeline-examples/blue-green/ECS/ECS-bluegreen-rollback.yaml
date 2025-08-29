@@ -1,0 +1,46 @@
+name: ECS Rollback
+on:
+  workflow_dispatch:
+    inputs:
+      family: { description: "Task def family", required: true, default: "your-ecs-family" }
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPO: ${{ secrets.ECR_REPO }}
+  IMAGE_TAG: ${{ github.sha }}
+  OIDC_ROLE: ${{ secrets.OIDC_ROLE }}
+  CD_APP: ${{ secrets.CODEDEPLOY_APP }}
+  CD_GROUP: ${{ secrets.CODEDEPLOY_GROUP }}
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.OIDC_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Find previous task def
+        id: prev
+        run: |
+          PREV=$(aws ecs list-task-definitions --family-prefix "${{ inputs.family }}" --sort DESC \
+            --query 'taskDefinitionArns[1]' --output text)
+          echo "PREV=$PREV" >> $GITHUB_ENV
+          echo "Previous: $PREV"
+
+      - name: Trigger rollback deployment
+        run: |
+          CONTENT=$(jq --arg t "$PREV" '.Resources[0].TargetService.Properties.TaskDefinition=$t' ecs/appspec.json)
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name "$CD_APP" \
+            --deployment-group-name "$CD_GROUP" \
+            --deployment-config-name CodeDeployDefault.ECSAllAtOnce \
+            --revision "revisionType=AppSpecContent,appSpecContent={content=$(echo "$CONTENT" | jq -Rs .)}" \
+            --query 'deploymentId' --output text)
+          echo "Deployment: $DEPLOYMENT_ID"
+          aws deploy wait deployment-successful --deployment-id "$DEPLOYMENT_ID"

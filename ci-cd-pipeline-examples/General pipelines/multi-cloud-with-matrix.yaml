@@ -1,0 +1,42 @@
+name: ci-cd
+on:
+  push:
+    branches:
+      - master:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+      - run: npm ci && npm test
+      - run: docker build -t app:${{ github.sha }} .
+      - run: echo "${{ github.sha }}" > dist/VERSION
+      - run: syft packages dir:. -o spdx-json > sbom.json
+      - run: cosign sign --key ${{ secrets.COSIGN_KEY }} app:${{ github.sha }}
+      - run: docker save app:${{ github.sha }} | gzip > app.tgz
+      - uses: actions/upload-artifact@v4
+        with: { name: image, path: app.tgz }
+
+  deploy:
+    needs: [build]
+    strategy:
+      matrix: { cloud: [aws, azure, gcp] }
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: image, path: . }
+      - run: gunzip -c app.tgz | docker load
+      # Auth per cloud
+      - if: matrix.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: ${{ secrets.AWS_ROLE }}, aws-region: ap-southeast-2 }
+      - if: matrix.cloud == 'azure'
+        uses: azure/login@v2
+        with: { client-id: ${{ secrets.AZURE_CLIENT_ID }}, tenant-id: ${{ secrets.AZURE_TENANT_ID }}, subscription-id: ${{ secrets.AZURE_SUB_ID }} }
+      - if: matrix.cloud == 'gcp'
+        uses: google-github-actions/auth@v2
+        with: { workload_identity_provider: ${{ secrets.GCP_WIP }}, service_account: ${{ secrets.GCP_SA }} }
+      # Push to each cloud’s registry & deploy
+      - run: ./scripts/publish_and_deploy.sh ${{ matrix.cloud }} ${{ github.sha }}

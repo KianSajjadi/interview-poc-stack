@@ -1,0 +1,228 @@
+name: ECS Blue/Green (CodeDeploy Canary)
+on:
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: ecs-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPO: ${{ secrets.ECR_REPO }}
+  IMAGE_TAG: ${{ github.sha }}
+  OIDC_ROLE: ${{ secrets.OIDC_ROLE }}
+  CD_APP: ${{ secrets.CODEDEPLOY_APP }}
+  CD_GROUP: ${{ secrets.CODEDEPLOY_GROUP }}
+  CLUSTER: ${{ secrets.CLUSTER }}
+  SERVICE: ${{ secrets.SERVICE }}
+  VULN_SEVERITY: CRITICAL,HIGH
+  SMOKE_URL: https://kian-green-deploy.com/healthz
+
+# let's assume my self hosted runner has every package I need for this workflow installed
+
+jobs:
+  test:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+
+# ############################## CACHE LANGUAGES ############################# #
+# let's assume i'm using node and go
+      - name: Cache Node
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            node_modules
+          key: node-${{ runner.os }}-${{ hashFiles('**/package-lock.json','**/pnpm-lock.yaml','**/yarn.lock') }}
+          restore-keys: node-${{ runner.os }}-
+
+      - name: Cache Go
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: go-${{ runner.os }}-
+
+      - name: Install deps & run tests
+        run: |
+          set -e
+          if [ -f package.json ]; then
+            if [ -f pnpm-lock.yaml ]; then npm i -g pnpm && pnpm i && pnpm test; \
+            elif [ -f yarn.lock ]; then npm i -g yarn && yarn install --frozen-lockfile && yarn test; \
+            else npm ci && npm test; fi
+          fi
+          if [ -f go.mod ]; then
+            go test ./... -count=1
+          fi
+
+# SAST with semgrep, only high/critical are failures
+      - uses: returntocorp/semgrep-action@v1
+        with:
+          config: p/ci
+          generateSarif: "1"
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+
+# check for secrets
+      - uses: gitleaks/gitleaks-action@v2
+        with:
+          args: "--redact --verbose"
+
+
+  build-scan-sign:
+    needs: [test]
+    runs-on: [self-hosted, linux, x64]
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.OIDC_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image URI
+        id: meta
+        run: |
+          echo "image_uri=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}" >> $GITHUB_OUTPUT
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+# ################################# VULN SCAN ################################ #
+# This uses Trivy to scan the filesystem - scan repo before build to avoid wastiing time
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-${{ runner.os }}-${{ hashFiles('**/package-lock.json','**/go.sum') }}
+          restore-keys: trivy-${{ runner.os }}-
+
+      - name: Trivy FS scan (fail on High/Critical)
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          scan-type: fs
+          format: table
+          severity: ${{ env.VULN_SEVERITY }}
+          exit-code: '1'
+
+# ################################ BUILD IMAGE ############################### #
+      - name: Build image with caching
+        run: |
+          docker buildx build \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            -t "${{ steps.meta.outputs.image_uri }}" \
+            .
+
+# ################################ PUSH IMAGE ################################ #
+      - name: Push image
+        run: docker push "${{ steps.meta.outputs.image_uri }}"
+
+# ################################ SCAN IMAGE ################################ #
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image_uri }}
+          format: table
+          severity: ${{ env.VULN_SEVERITY }}
+          exit-code: '1'        
+
+# ################################### SBOM ################################### #
+# The SBOM is generated via Syft
+# I love BOMs when doing any mechanical/robotics projects so of course I love SBOMs
+      - name: Generate SBOM
+        run: |
+          curl -sSfL https://github.com/anchore/syft/releases/latest/download/syft_Linux_x86_64.tar.gz | \
+            tar xz -C /usr/local/bin syft
+          syft "${{ steps.meta.outputs.image_uri }}" -o spdx-json > sbom.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ env.IMAGE_TAG }}
+          path: sbom.json
+
+# ################################## COSIGN ################################## #
+# keyless via OIDC very nice
+      - name: Cosign sign (keyless)
+        env:
+          COSIGN_EXPERIMENTAL: 1
+        run: cosign sign --yes "${{ steps.meta.outputs.image_uri }}"
+
+# ############################################################################ #
+#                                    DEPLOY                                    #
+# ############################################################################ #
+  deploy-blue-green:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build_scan_sign]
+    runs-on: [self-hosted, linux, x64]
+    permissions:
+      id-token: write
+      contents: read
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.OIDC_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Render & register task definition
+        id: taskdef
+        run: |
+          IMAGE="${{ needs.build_scan_sign.outputs.image_uri }}"
+          jq --arg img "$IMAGE" '.containerDefinitions[0].image=$img' \
+            ecs/taskdef-template.json > ecs/taskdef.json
+          TASKDEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://ecs/taskdef.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "TASKDEF_ARN=$TASKDEF_ARN" >> $GITHUB_ENV
+
+      - name: Prepare AppSpec
+        run: |
+          sed "s#REPLACE_TASKDEF_ARN#${TASKDEF_ARN}#g" ecs/appspec.json > ecs/appspec.rendered.json
+  
+      - name: Create CodeDeploy deployment (canary-style)
+        id: cd
+        run: |
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name "${{ env.CD_APP }}" \
+            --deployment-group-name "${{ env.CD_GROUP }}" \
+            --deployment-config-name CodeDeployDefault.ECSCanary10Percent5Minutes \
+            --revision "revisionType=AppSpecContent,appSpecContent={content=$(cat ecs/appspec.rendered.json | jq -Rs .)}" \
+            --query 'deploymentId' --output text)
+          echo "DEPLOYMENT_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
+          echo "Deployment: $DEPLOYMENT_ID"
+      
+      - name: Wait for CodeDeploy success (auto-rollback on alarms)
+        run: aws deploy wait deployment-successful --deployment-id "$DEPLOYMENT_ID"
+
+      - name: Smoke test (GREEN)
+        run: |
+          if [ -n "${SMOKE_URL}" ]; then
+            for i in {1..10}; do
+              code=$(curl -s -o /dev/null -w "%{http_code}" "${SMOKE_URL}") || true
+              echo "Attempt $i -> $code"
+              [ "$code" = "200" ] && exit 0
+              sleep 5
+            done
+            echo "Smoke test failed"
+            exit 1
+          else
+            echo "SMOKE_URL not set; skipping."
+          fi
